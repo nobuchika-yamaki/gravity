@@ -1,0 +1,369 @@
+#!/usr/bin/env python3
+# -*- coding: utf-8 -*-
+
+"""
+GMVM (Gravity-Modulated Viability Model) - Review-ready reproducible pipeline
+
+This script:
+  1) loads benchmark data from CSV (or uses embedded fallback CSV)
+  2) computes derived quantities (xi, b, log10_b)
+  3) generates all figures needed for the Results + Supplement:
+       Figure 1: Envelopes + benchmark scatter
+       Figure 2: log10(b) scatter + jitter (microbe vs plant)
+       Figure 3: Crossover width comparison using log(Q)
+       Figure S1: Sensitivity analysis b(D) for microbe and plant scales
+  4) saves a processed CSV with derived columns
+
+Input CSV columns (exactly 9 columns):
+  system_id,condition_id,g,R,Q,time,tau_adapt,D,tau_structure
+
+Run:
+  python gmvm_review_pipeline.py
+
+Outputs (default: ./gmvm_outputs):
+  - Figure_1_Envelopes.png
+  - Figure_2_b_Jitter.png
+  - Figure_3_CrossoverWidth_logQ.png
+  - Figure_S1_Sensitivity.png
+  - processed_benchmark_with_derived.csv
+  - run_manifest.txt  (explicit parameter settings)
+
+Notes:
+  - Uses only ASCII in axis labels/captions to avoid Word garbling.
+  - Deterministic. No bootstrap unless you add it explicitly.
+"""
+
+from __future__ import annotations
+
+import os
+import io
+import sys
+import numpy as np
+import pandas as pd
+import matplotlib.pyplot as plt
+
+
+# =========================
+# 0) Configuration (explicit; cite these numbers in Methods/Results)
+# =========================
+
+OUTPUT_DIR = "./gmvm_outputs"
+BENCHMARK_CSV_PATH = "benchmark_data.csv"  # optional external input
+
+# Earth gravity reference (dimensionless in this script)
+G0 = 1.0
+
+# Plot export settings
+DPI = 300
+
+# Envelope parameterization at reference size R_REF
+R_REF   = 1e-6
+A_MINUS0 = 0.35
+A_PLUS0  = 0.55
+DELTA0   = 0.85
+
+# Size scaling exponents
+P_MINUS = 0.0
+P_PLUS  = 1.0
+P_DELTA = 0.0
+
+# Figure 1: sizes shown as envelopes
+R_LINES = [1e-6, 1e-3, 5e-2]
+
+# Gravity grid
+G_MIN, G_MAX = 1e-6, 1e3
+N_G = 900
+
+# Sensitivity analysis for D
+D_MIN, D_MAX = 1e-14, 1e-8
+N_D = 500
+R_MICRO_S1 = 1e-6
+R_PLANT_S1 = 5e-2
+TAU_MICRO_S1 = 600.0
+TAU_PLANT_S1 = 3600.0
+
+# Figure 3: crossover comparison (same size, different Delta)
+R_TARGET_F3 = 5e-2
+DELTA_SMOOTH_F3 = 0.50
+DELTA_SHARP_F3  = 0.05
+
+
+# =========================
+# 1) Embedded fallback CSV (kept minimal; replace with your real CSV if available)
+# =========================
+
+BENCHMARK_CSV = """system_id,condition_id,g,R,Q,time,tau_adapt,D,tau_structure
+S_desic_micro,S_desic_ug,1e-6,1e-6,1.19,100,3600,1e-12,600
+S_desic_mars,S_desic_mars,0.38,1e-6,1.19,100,3600,1e-12,600
+S_desic_earth,S_desic_1g,1.0,1e-6,1.00,100,3600,1e-12,600
+B_subt_micro,B_subt_ug,1e-6,1e-6,1.25,100,3600,1e-12,600
+B_subt_mars,B_subt_mars,0.38,1e-6,0.88,100,3600,1e-12,600
+B_subt_earth,B_subt_1g,1.0,1e-6,1.00,100,3600,1e-12,600
+C_metal_micro,C_metal_ug,1e-6,1e-6,0.74,100,3600,1e-12,600
+C_metal_mars,C_metal_mars,0.38,1e-6,0.77,100,3600,1e-12,600
+C_metal_earth,C_metal_1g,1.0,1e-6,1.00,100,3600,1e-12,600
+Plant_Elong_low,Plant_low,1e-4,0.05,1.60,500,86400,1e-10,3600
+Plant_Elong_mid,Plant_1g,1.0,0.05,1.00,500,86400,1e-10,3600
+Plant_Elong_high,Plant_high,300.0,0.05,0.65,500,86400,1e-10,3600
+"""
+
+
+# =========================
+# 2) Core functions (Methods 2.3-2.5)
+# =========================
+
+def coupling_parameter_b(R: np.ndarray | float,
+                         D: np.ndarray | float,
+                         tau_structure: np.ndarray | float) -> np.ndarray:
+    # Methods 2.3: b = R^2 / (D * tau_structure)
+    R = np.asarray(R, dtype=float)
+    D = np.asarray(D, dtype=float)
+    tau_structure = np.asarray(tau_structure, dtype=float)
+    return (R ** 2) / (D * tau_structure)
+
+
+def size_scaled_params(R: float) -> tuple[float, float, float]:
+    # Methods 2.5: scaling to reduce degrees of freedom
+    ratio = float(R) / float(R_REF)
+    a_minus = float(A_MINUS0) * (ratio ** float(P_MINUS))
+    a_plus  = float(A_PLUS0)  * (ratio ** float(P_PLUS))
+    Delta   = float(DELTA0)   * (ratio ** float(P_DELTA))
+    return a_minus, a_plus, Delta
+
+
+def gmvm_envelope(g: np.ndarray,
+                  a_minus: float,
+                  a_plus: float,
+                  Delta: float,
+                  g0: float = G0) -> np.ndarray:
+    # Methods 2.4
+    # xi = ln(g/g0)
+    # s = 0.5 * (1 + tanh(xi/Delta))
+    # a_eff = (1-s)a_minus + s a_plus
+    # Q(g) = exp( - a_eff * xi^2 )
+    g = np.asarray(g, dtype=float)
+    xi = np.log(g / float(g0))
+    s = 0.5 * (1.0 + np.tanh(xi / float(Delta)))
+    a_eff = (1.0 - s) * float(a_minus) + s * float(a_plus)
+    return np.exp(-a_eff * (xi ** 2))
+
+
+# =========================
+# 3) Robust data loading (Methods 2.6)
+# =========================
+
+def _read_csv_strict(path: str) -> pd.DataFrame:
+    """
+    Strictly enforce 9 columns. If the user's CSV has accidental extra commas,
+    we fail with a clear message rather than a cryptic ParserError.
+    """
+    if os.path.exists(path):
+        raw = open(path, "r", encoding="utf-8").read()
+    else:
+        raw = BENCHMARK_CSV
+
+    # quick sanity check: count columns per line (comma-separated)
+    lines = [ln for ln in raw.splitlines() if ln.strip()]
+    header = lines[0].split(",")
+    if len(header) != 9:
+        raise ValueError(
+            f"CSV header must have exactly 9 columns, got {len(header)}: {header}"
+        )
+
+    # detect first line with wrong field count
+    for i, ln in enumerate(lines[1:], start=2):
+        n = len(ln.split(","))
+        if n != 9:
+            raise ValueError(
+                f"CSV field count mismatch at line {i}: expected 9 fields, saw {n}.\n"
+                f"Offending line:\n{ln}\n\n"
+                "Fix: remove stray commas or ensure each row has exactly 9 comma-separated values."
+            )
+
+    df = pd.read_csv(io.StringIO(raw))
+
+    required = ["system_id", "condition_id", "g", "R", "Q",
+                "time", "tau_adapt", "D", "tau_structure"]
+    missing = [c for c in required if c not in df.columns]
+    if missing:
+        raise ValueError(f"Missing required columns: {missing}")
+
+    # numeric cast
+    for c in ["g", "R", "Q", "time", "tau_adapt", "D", "tau_structure"]:
+        df[c] = pd.to_numeric(df[c], errors="raise")
+
+    return df
+
+
+def load_and_derive(path: str) -> pd.DataFrame:
+    df = _read_csv_strict(path)
+    df["xi"] = np.log(df["g"].values / float(G0))
+    df["b"] = coupling_parameter_b(df["R"].values, df["D"].values, df["tau_structure"].values)
+    df["log10_b"] = np.log10(df["b"].values)
+    return df
+
+
+# =========================
+# 4) Figure builders (Results + Supplement)
+# =========================
+
+def make_figure_1(df: pd.DataFrame, outpath: str) -> None:
+    g_grid = np.logspace(np.log10(G_MIN), np.log10(G_MAX), N_G)
+
+    plt.figure(figsize=(7.2, 5.2))
+    plt.scatter(df["g"], df["Q"], s=22, alpha=0.35, label="Benchmark data")
+
+    for R in R_LINES:
+        a_minus, a_plus, Delta = size_scaled_params(R)
+        Q_line = gmvm_envelope(g_grid, a_minus=a_minus, a_plus=a_plus, Delta=Delta, g0=G0)
+        plt.plot(g_grid, Q_line, linewidth=2, label=f"Envelope: R={R:.0e} m")
+
+    plt.xscale("log")
+    plt.axvline(G0, linestyle="--", linewidth=1)
+
+    plt.xlabel("Gravity (g / g_earth)")
+    plt.ylabel("Normalized performance Q")
+    plt.title("Figure 1. Size-dependent viability envelopes")
+    plt.legend()
+    plt.tight_layout()
+    plt.savefig(outpath, dpi=DPI)
+    plt.close()
+
+
+def make_figure_2_jitter(df: pd.DataFrame, outpath: str) -> None:
+    """
+    Cleanest Figure 2:
+      x axis: log10(b)
+      y axis: dummy categories (0,1) + jitter
+      microbial vs plant shifted slightly
+    """
+    # category rule (paper-safe; explicit)
+    micro = df[df["R"] <= 1e-5].copy()
+    plant = df[df["R"] >= 1e-3].copy()
+
+    rng = np.random.default_rng(0)  # deterministic jitter
+
+    y_micro = 0.0 + rng.normal(0.0, 0.03, size=len(micro))
+    y_plant = 1.0 + rng.normal(0.0, 0.03, size=len(plant))
+
+    plt.figure(figsize=(7.0, 3.6))
+    plt.scatter(micro["log10_b"].values, y_micro, s=30, alpha=0.8, label="Microbial")
+    plt.scatter(plant["log10_b"].values, y_plant, s=30, alpha=0.8, label="Plant-scale")
+
+    plt.yticks([0, 1], ["Microbial", "Plant-scale"])
+    plt.xlabel("log10(b)")
+    plt.ylabel("")  # intentionally blank
+    plt.title("Figure 2. Order separation of coupling parameter b")
+    plt.legend(loc="best")
+    plt.tight_layout()
+    plt.savefig(outpath, dpi=DPI)
+    plt.close()
+
+
+def make_figure_3_logQ(outpath: str) -> None:
+    """
+    Figure 3 with log Q on y-axis (avoids needle-like peak impression).
+    """
+    g_grid = np.logspace(np.log10(G_MIN), np.log10(G_MAX), N_G)
+    a_minus, a_plus, _ = size_scaled_params(R_TARGET_F3)
+
+    Q_smooth = gmvm_envelope(g_grid, a_minus=a_minus, a_plus=a_plus, Delta=DELTA_SMOOTH_F3, g0=G0)
+    Q_sharp  = gmvm_envelope(g_grid, a_minus=a_minus, a_plus=a_plus, Delta=DELTA_SHARP_F3,  g0=G0)
+
+    # log(Q) (natural log)
+    logQ_smooth = np.log(Q_smooth)
+    logQ_sharp  = np.log(Q_sharp)
+
+    plt.figure(figsize=(7.2, 5.2))
+    plt.plot(g_grid, logQ_smooth, linewidth=2, label=f"Delta={DELTA_SMOOTH_F3:.2f} (smooth)")
+    plt.plot(g_grid, logQ_sharp,  linewidth=2, label=f"Delta={DELTA_SHARP_F3:.2f} (sharp)")
+    plt.xscale("log")
+    plt.axvline(G0, linestyle="--", linewidth=1)
+
+    plt.xlabel("Gravity (g / g_earth)")
+    plt.ylabel("log(Q)")
+    plt.title("Figure 3. Crossover width and cliff-like limiting behavior")
+    plt.legend()
+    plt.tight_layout()
+    plt.savefig(outpath, dpi=DPI)
+    plt.close()
+
+
+def make_figure_s1(outpath: str) -> None:
+    D_vals = np.logspace(np.log10(D_MIN), np.log10(D_MAX), N_D)
+    b_micro = coupling_parameter_b(R_MICRO_S1, D_vals, TAU_MICRO_S1)
+    b_plant = coupling_parameter_b(R_PLANT_S1, D_vals, TAU_PLANT_S1)
+
+    plt.figure(figsize=(7.0, 5.0))
+    plt.plot(D_vals, b_micro, linewidth=2, label="Microbe (R=1e-6 m, tau=600 s)")
+    plt.plot(D_vals, b_plant, linewidth=2, label="Plant (R=5e-2 m, tau=3600 s)")
+    plt.xscale("log")
+    plt.yscale("log")
+    plt.axhline(1.0, linestyle="--", linewidth=1)
+
+    plt.xlabel("Diffusion coefficient D (m^2/s)")
+    plt.ylabel("Coupling parameter b")
+    plt.title("Figure S1. Sensitivity analysis of coupling parameter b")
+    plt.legend()
+    plt.tight_layout()
+    plt.savefig(outpath, dpi=DPI)
+    plt.close()
+
+
+# =========================
+# 5) Main
+# =========================
+
+def write_manifest(outdir: str) -> None:
+    p = os.path.join(outdir, "run_manifest.txt")
+    with open(p, "w", encoding="utf-8") as f:
+        f.write("GMVM reproducible run manifest\n")
+        f.write("\nExplicit parameter settings used:\n")
+        f.write(f"R_REF={R_REF}\nA_MINUS0={A_MINUS0}\nA_PLUS0={A_PLUS0}\nDELTA0={DELTA0}\n")
+        f.write(f"P_MINUS={P_MINUS}\nP_PLUS={P_PLUS}\nP_DELTA={P_DELTA}\n")
+        f.write(f"R_LINES={R_LINES}\n")
+        f.write(f"G_RANGE=[{G_MIN}, {G_MAX}], N_G={N_G}\n")
+        f.write("\nSensitivity (Figure S1):\n")
+        f.write(f"D_RANGE=[{D_MIN}, {D_MAX}], N_D={N_D}\n")
+        f.write(f"R_MICRO={R_MICRO_S1}, TAU_MICRO={TAU_MICRO_S1}\n")
+        f.write(f"R_PLANT={R_PLANT_S1}, TAU_PLANT={TAU_PLANT_S1}\n")
+        f.write("\nFigure 3:\n")
+        f.write(f"R_TARGET={R_TARGET_F3}\nDELTA_SMOOTH={DELTA_SMOOTH_F3}\nDELTA_SHARP={DELTA_SHARP_F3}\n")
+
+
+def main() -> None:
+    os.makedirs(OUTPUT_DIR, exist_ok=True)
+
+    df = load_and_derive(BENCHMARK_CSV_PATH)
+
+    # Save processed table
+    processed_path = os.path.join(OUTPUT_DIR, "processed_benchmark_with_derived.csv")
+    df.to_csv(processed_path, index=False)
+
+    # Figures
+    fig1 = os.path.join(OUTPUT_DIR, "Figure_1_Envelopes.png")
+    fig2 = os.path.join(OUTPUT_DIR, "Figure_2_b_Jitter.png")
+    fig3 = os.path.join(OUTPUT_DIR, "Figure_3_CrossoverWidth_logQ.png")
+    figs1 = os.path.join(OUTPUT_DIR, "Figure_S1_Sensitivity.png")
+
+    make_figure_1(df, fig1)
+    make_figure_2_jitter(df, fig2)
+    make_figure_3_logQ(fig3)
+    make_figure_s1(figs1)
+    write_manifest(OUTPUT_DIR)
+
+    print("GMVM pipeline complete. Outputs:")
+    print(" -", fig1)
+    print(" -", fig2)
+    print(" -", fig3)
+    print(" -", figs1)
+    print(" -", processed_path)
+    print(" -", os.path.join(OUTPUT_DIR, "run_manifest.txt"))
+
+
+if __name__ == "__main__":
+    try:
+        main()
+    except Exception as e:
+        print("ERROR:", str(e), file=sys.stderr)
+        sys.exit(1)
